@@ -1,3 +1,14 @@
+#!/usr/bin/env python3
+"""
+File: timelapse_of_water_body_extension.py
+Author: Simone De Camillis
+Date: 2025-08-01
+Description: This script identifies and calculates the extent of a water body 
+  of interest, analysing the Sentinel-2 SR data from the Google Earth Engine
+  datasets. A gif of the RGB images highlighting the water profile is provided 
+  as output.
+Requirements: An account on Google Earth Engine (GEE) and an active GEE project.
+"""
 import ee
 import geemap
 import os
@@ -5,23 +16,33 @@ from PIL import ImageDraw, ImageFont
 from IPython.display import Image, display
 import urllib.request
 
+# ********************** INPUT PARAMETERS *************************
+
 # GOOGLE EARTH ENGINE - USER INFO
 PROJECT_NAME = 'YOUR-PROJECT-NAME'
 
-# ****** INPUT PARAMETERS *********
 # Define the starting date for the timelapse (starting from 2018-10-01)
 # See details on 'https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_S2_HARMONIZED'
 START_DATE = '2019-10-01'
+
 # Define the step size expressed in number of months
 STEP = 3
+
 # Define the duration of the timelapse expressed in number of months
 DURATION = 66
+
 # Define the max pixel probability of clound accepted for the dataset
 MAX_CLOUD_PROBABILITY = 30
+
 # Output filename
-FILENAME = 'lake_george.gif'
+FILENAME = 'lake_george'
+
+# Gif frame per second
+FPS = 1.5
+
 # Define the rectangle of interest for the analysis (only 2 coordinates)
 RECTANGLE_OF_INTEREST = [[149.33, -35.22], [149.52, -34.96]]
+
 # [OPTIONAL] Define a specific region where to search the largest water body 
 # (list of points defining a closed polyline, i.e. the last point must be equal 
 # to the first one).
@@ -57,6 +78,9 @@ POLYGON_SEARCH_REGION = [
           [149.39077392578125, -34.98095836814947]
           ]
 
+# ********************** SCRIPT BODY *************************
+
+print('Authetication process into Google Earth Engine ...')
 # Trigger the authentication flow.
 ee.Authenticate()
 
@@ -122,10 +146,20 @@ def generate_img_collection(idx):
 
   # Apply mask to remove areas with probability of clouds, make the median
   # and create property of median time.
-  s2_processed = ee.ImageCollection(s2_with_mask).map(maskClouds) \
-                        .median().divide(10000) \
-                        .set('med_time', start.format('YYYY-MM'))
+  # If images are not available for the identified timerange, add empty image
+  data_n = s2_with_mask.size()
+  s2_processed = ee.Algorithms.If(data_n.eq(0),
+                                  ee.Image(0) \
+                                        .set('med_time', start.format('YYYY-MM')) \
+                                        .set('valid', 0),
+                                  ee.ImageCollection(s2_with_mask).map(maskClouds) \
+                                        .median().divide(10000) \
+                                        .set('med_time', start.format('YYYY-MM')) \
+                                        .set('valid', 1)
+                                  )
+  return s2_processed
 
+def calculate_awei_in_collection(s2_processed):
   # Calculate and add AWEI mask
   s2_awei_mask = calculateAWEI(s2_processed).rename('AWEI_MASK').gte(0.2)
   s2_awei_mask = s2_awei_mask.updateMask(s2_awei_mask)
@@ -192,7 +226,25 @@ def generate_img_collection(idx):
 
 # Generate main collection of data with given filters and required bands
 month_idx = ee.List.sequence(0, DURATION, STEP)
+#collection = ee.ImageCollection.fromImages(month_idx.map(generate_img_collection)) \
+#                              .filter(ee.Filter.neq('valid', 0))
+
+print('Selecting data from the database ...')
 collection = ee.ImageCollection.fromImages(month_idx.map(generate_img_collection))
+
+# Identify empty images and output a warning.
+empty_img_list = collection.filter(ee.Filter.eq('valid', 0)) \
+                           .reduceColumns(reducer=ee.Reducer.toList(), \
+                                selectors=['med_time']).get('list').getInfo()
+if empty_img_list:
+  print(f'WARNING: Empty images for: {empty_img_list}.')
+
+# Remove empty images from the collection
+collection = collection.filter(ee.Filter.neq('valid', 0))
+
+# Add the awei layer in the images of the collection
+print('Identifying water features in the dataset ...')
+collection = collection.map(calculate_awei_in_collection)
 
 # Get list of 'med_time'
 med_time_list = collection.reduceColumns(reducer=ee.Reducer.toList(), \
@@ -216,6 +268,7 @@ def visualize_image_awei(image):
   return output
 
 # Create RGB visualization images for use as animation frames.
+print('Setting images ...')
 rgbVis = collection.map(visualize_image_awei)
 
 # Define thumbnail parameters
@@ -223,29 +276,32 @@ thumb_params = {
     'region': region,
     'dimensions': 520,
     'crs': 'EPSG:3857',
-    'framesPerSecond': 1.5,
+    'framesPerSecond': FPS,
     'format': 'gif'
 }
 
 # Get URL that will produce the animation when accessed.
+print('Producing and saving gif ...')
 gif_url = rgbVis.getVideoThumbURL(thumb_params)
-#print(gif_url)
-#display(Image(url=gif_url))
 
 # Save gif locally
-gif_path = os.path.join(os.getcwd(), FILENAME)
-urllib.request.urlretrieve(gif_url, gif_path)
+output_path = os.path.dirname(os.path.realpath(__file__))
+output_file = os.path.join(output_path, FILENAME + '.gif')
+urllib.request.urlretrieve(gif_url, output_file)
 
 # Generate label of the gif frames
 label = [f'{x}, {y/1e6:06.2f} km^2' for x,y in zip(med_time_list, area_list)]
 
 # Add labels to the gif frames
+print('Add labels to gif ...')
 geemap.add_text_to_gif(
-    gif_path,
-    gif_path,
+    output_file,
+    output_file,
     xy=("5%", "3%"),
     text_sequence=label,
     font_size=24,
     font_color="#ffffff",
     duration=666, # in ms
 )
+
+print("... Completed")
